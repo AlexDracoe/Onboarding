@@ -1,0 +1,4 @@
+/droned
+*.db
+*.db-wal
+*.db-shm

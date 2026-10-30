@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+drone.db*
+tests
+*.md
+.git
+claude/
+.gitignore
+.pytest_cache

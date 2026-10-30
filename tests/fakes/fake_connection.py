@@ -16,3 +16,5 @@ class FakeConnection():
     def disconnect(self):
         self.connected = False
         print("Simulated disconnection.")
+    def mode_mapping(self):
+            return {"STABILIZE": 0, "GUIDED": 4, "RTL": 6}

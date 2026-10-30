@@ -10,7 +10,6 @@ class Mapper:
             "COMMAND_ACK": self.map_command_ack,
             #"BATTERY_STATUS":self.map_battery_status,
         }
-        pass
 
     def map(self, message):
         message_type = message.get_type()

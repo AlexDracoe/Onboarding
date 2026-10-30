@@ -1,4 +1,10 @@
+import logging
+
 from pymavlink import mavutil
+
+from config import CONFIG
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -14,7 +20,7 @@ class PymavlinkConnection():
     def wait_for_heartbeat(self):
         if self.connection:
             self.connection.wait_heartbeat()
-            print("Heartbeat from system (system %u component %u)" % (self.connection.target_system, self.connection.target_component))
+            logger.info("Heartbeat from system %u component %u", self.connection.target_system, self.connection.target_component)
         else:
             raise Exception("Connection not established. Call connect() first.")
 
@@ -25,7 +31,8 @@ class PymavlinkConnection():
     
     def receive(self):
         if self.connection:
-            message = self.connection.recv_match(blocking=True)
+            # Returns None after the timeout, so the Receiver loop can notice stop_event.
+            message = self.connection.recv_match(blocking=True, timeout=CONFIG.receive_timeout_s)
             return message
         else:
             raise Exception("Connection not established. Call connect() first.")
@@ -33,6 +40,12 @@ class PymavlinkConnection():
     def send(self, command):
         if self.connection:
             self.connection.mav.send(command)
-            print("sent command")
-            print(command)
+            logger.info("Sent command: %s", command)
+
+    def mode_mapping(self):
+        """Mode name to number"""
+
+        if self.connection:
+            return self.connection.mode_mapping()
+        raise Exception("Connection not established. Call connect() first")
 

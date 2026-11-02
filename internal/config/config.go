@@ -6,14 +6,14 @@ import (
 )
 
 type Config struct {
-	AckTimeout        time.Duration
-	ReceiveBackoff    time.Duration
-	ReceiveTimeout    time.Duration
-	StatePollInterval time.Duration
-	StartupTimeout    time.Duration
-	ConnectionString  string
-	DBPath            string
-	HTTPAddr          string
+	AckTimeout        time.Duration `json:"ack_timeout"`
+	ReceiveBackoff    time.Duration `json:"receive_backoff"`
+	ReceiveTimeout    time.Duration `json:"receive_timeout"`
+	StatePollInterval time.Duration `json:"state_poll_interval"`
+	StartupTimeout    time.Duration `json:"startup_timeout"`
+	ConnectionString  string        `json:"connection_string"`
+	DBPath            string        `json:"db_path"`
+	HTTPAddr          string        `json:"http_addr"`
 }
 
 func Load() Config {

@@ -41,10 +41,10 @@ def create_app(connection_factory=PymavlinkConnection) -> FastAPI:
         with ExitStack() as stack:
             connection = connection_factory()
             connection.connect(CONFIG.connection_string)
-            stack.callback(connection.disconnect)            # runs last
+            stack.callback(connection.disconnect)           
 
             command_log = SqliteCommandLog(CONFIG.db_path)
-            stack.callback(command_log.close)                # runs second to last
+            stack.callback(command_log.close)                
 
             state_manager = StateManager()
             ack_tracker = AckTracker()
@@ -53,7 +53,7 @@ def create_app(connection_factory=PymavlinkConnection) -> FastAPI:
             receiver_thread.start()
 
             def stop_receiver():
-                # Stop and wait BEFORE the connection closes, or the thread reads a dead socket.
+                
                 receiver.stop()
                 receiver_thread.join(timeout=RECEIVER_JOIN_TIMEOUT_S)
                 if receiver_thread.is_alive():
@@ -67,7 +67,7 @@ def create_app(connection_factory=PymavlinkConnection) -> FastAPI:
             app.state.command_log = command_log
             app.state.service = service
             logger.info("Service ready, listening to %s", CONFIG.connection_string)
-            yield                                            # the server runs here
+            yield                                         
         logger.info("Service stopped")
 
     app = FastAPI(title="Drone service", lifespan=lifespan)

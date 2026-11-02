@@ -1,0 +1,72 @@
+services:
+  backend:
+    build: ./alpha
+    environment:
+      DB_PATH: /data/drone.db
+      MAVLINK_CONNECTION: udpin:0.0.0.0:14540
+    ports:
+      - "14540:14540/udp"
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - drone-data:/data
+    restart: unless-stopped
+    # `docker compose watch`: copy changed source into the container and restart uvicorn;
+    # rebuild the image when dependencies or the Dockerfile change.
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./alpha
+          target: /app
+          ignore:
+            - .venv/
+            - __pycache__/
+            - tests/
+            - drone.db*
+        - action: rebuild
+          path: ./alpha/requirements.txt
+        - action: rebuild
+          path: ./alpha/Dockerfile
+
+  # Prod-style: static build served by nginx on http://localhost:8080
+  # Start with: docker compose --profile prod up --build -d
+  web:
+    profiles: [prod]
+    build: ./web
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+  # Default: Vite with hot reload on http://localhost:5173
+  # Start backend + frontend with: docker compose up --build --watch
+  web-dev:
+    build:
+      context: ./web
+      target: dev
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    develop:
+      watch:
+        - action: sync
+          path: ./web/src
+          target: /app/src
+        - action: sync
+          path: ./web/public
+          target: /app/public
+        - action: sync
+          path: ./web/index.html
+          target: /app/index.html
+        - action: sync+restart
+          path: ./web/vite.config.ts
+          target: /app/vite.config.ts
+        - action: rebuild
+          path: ./web/package.json
+        - action: rebuild
+          path: ./web/Dockerfile
+
+volumes:
+  drone-data:

@@ -31,8 +31,7 @@ class VehicleStateOut(BaseModel):
     position: PositionOut | None = None
     velocity: VelocityOut | None = None
     heading: float | None = None
-    # Left out on purpose: batteries (not mapped yet) and the monotonic *_update_time fields
-    # (not wall-clock, meaningless to a client).
+    
 
 
 class CommandAccepted(BaseModel):
@@ -53,5 +52,5 @@ class CommandRecord(BaseModel):
 
 
 class ErrorBody(BaseModel):
-    error: str    # stable machine-readable code, e.g. UNKNOWN_COMMAND, NO_VEHICLE
-    detail: str   # human-readable
+    error: str   
+    detail: str   

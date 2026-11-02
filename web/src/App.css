@@ -1,0 +1,82 @@
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+fieldset {
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+.offline {
+  opacity: 0.45;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.25rem 0.75rem 0.25rem 0;
+  border-bottom: 1px solid #ddd;
+}
+
+button {
+  padding: 0.5rem 1.25rem;
+  font-size: 1rem;
+}
+
+.banner {
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  background: #eee;
+}
+
+.banner-error {
+  background: #fdd;
+}
+
+.banner-warn {
+  background: #ffe9b3;
+}
+
+.hint {
+  color: #666;
+}
+
+.status-PENDING {
+  color: #b36b00;
+}
+
+.status-ACHIEVED {
+  color: #1a7f37;
+}
+
+.status-ACK_TIMEOUT,
+.status-COMMAND_REJECTED,
+.status-STATE_TIMEOUT,
+.status-ALREADY_PENDING,
+.status-FAILED {
+  color: #c62828;
+}
+details {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 0.25rem 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+details.selected {
+  border-color: #1a73e8;
+  background: #f1f6fe;
+}
+
+summary {
+  cursor: pointer;
+  font-weight: 600;
+}

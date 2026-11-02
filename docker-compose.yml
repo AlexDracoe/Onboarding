@@ -1,5 +1,12 @@
+# Pick a backend with a profile; the frontend comes with either:
+#   docker compose --profile py up --build --watch   # Python (alpha) + web on :5173
+#   docker compose --profile go up --build --watch   # Go (beta) + web on :5173
+# Run one backend at a time: both use ports 8000 and 14540/udp.
+# Prod-style nginx build on :8080:  docker compose up --build -d backend-py web
+
 services:
-  backend:
+  backend-py:
+    profiles: [py]
     build: ./alpha
     environment:
       DB_PATH: /data/drone.db
@@ -9,9 +16,10 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - drone-data:/data
+    networks:
+      default:
+        aliases: [backend]
     restart: unless-stopped
-    # `docker compose watch`: copy changed source into the container and restart uvicorn;
-    # rebuild the image when dependencies or the Dockerfile change.
     develop:
       watch:
         - action: sync+restart
@@ -27,19 +35,40 @@ services:
         - action: rebuild
           path: ./alpha/Dockerfile
 
-  # Prod-style: static build served by nginx on http://localhost:8080
-  # Start with: docker compose --profile prod up --build -d
-  web:
-    profiles: [prod]
-    build: ./web
+  backend-go:
+    profiles: [go]
+    build:
+      context: ./beta
+      target: dev
+    environment:
+      DB_PATH: /data/drone.db
+      MAVLINK_CONNECTION: udpin:0.0.0.0:14540
+      HTTP_ADDR: ":8000"
     ports:
-      - "8080:80"
-    depends_on:
-      - backend
+      - "14540:14540/udp"
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - drone-data-go:/data
+    networks:
+      default:
+        aliases: [backend]
+    develop:
+      watch:
+        - action: sync
+          path: ./beta
+          target: /app
+          ignore:
+            - droned
+            - drone.db*
+            - claude/
+        - action: rebuild
+          path: ./beta/go.mod
+        - action: rebuild
+          path: ./beta/Dockerfile
 
-  # Default: Vite with hot reload on http://localhost:5173
-  # Start backend + frontend with: docker compose up --build --watch
+  # Vite with hot reload on http://localhost:5173; proxies to whichever backend is up
   web-dev:
+    profiles: [py, go]
     build:
       context: ./web
       target: dev
@@ -47,8 +76,6 @@ services:
       BACKEND_URL: http://backend:8000
     ports:
       - "5173:5173"
-    depends_on:
-      - backend
     develop:
       watch:
         - action: sync
@@ -68,5 +95,13 @@ services:
         - action: rebuild
           path: ./web/Dockerfile
 
+  # Static build served by nginx on http://localhost:8080
+  web:
+    profiles: [prod]
+    build: ./web
+    ports:
+      - "8080:80"
+
 volumes:
-  drone-data:
+  drone-data:      # Python backend's existing volume, kept so you don't lose data
+  drone-data-go:

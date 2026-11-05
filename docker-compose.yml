@@ -1,7 +1,9 @@
 # Pick a backend with a profile; the frontend comes with either:
 #   docker compose --profile py up --build --watch   # Python (alpha) + web on :5173
 #   docker compose --profile go up --build --watch   # Go (beta) + web on :5173
-# Run one backend at a time: both use ports 8000 and 14540/udp.
+# Run one backend at a time: both use ports 8000 and MAVLINK_PORT/udp.
+# MAVLink UDP port defaults to 14540 (SITL). For a real link, e.g. the Kahuna on 14550:
+#   MAVLINK_PORT=14550 docker compose --profile go up --build --watch
 # Prod-style nginx build on :8080:  docker compose up --build -d backend-py web
 
 services:
@@ -10,9 +12,9 @@ services:
     build: ./alpha
     environment:
       DB_PATH: /data/drone.db
-      MAVLINK_CONNECTION: udpin:0.0.0.0:14540
+      MAVLINK_CONNECTION: udpin:0.0.0.0:${MAVLINK_PORT:-14540}
     ports:
-      - "14540:14540/udp"
+      - "${MAVLINK_PORT:-14540}:${MAVLINK_PORT:-14540}/udp"
       - "127.0.0.1:8000:8000"
     volumes:
       - drone-data:/data
@@ -42,10 +44,10 @@ services:
       target: dev
     environment:
       DB_PATH: /data/drone.db
-      MAVLINK_CONNECTION: udpin:0.0.0.0:14540
+      MAVLINK_CONNECTION: udpin:0.0.0.0:${MAVLINK_PORT:-14540}
       HTTP_ADDR: ":8000"
     ports:
-      - "14540:14540/udp"
+      - "${MAVLINK_PORT:-14540}:${MAVLINK_PORT:-14540}/udp"
       - "127.0.0.1:8000:8000"
     volumes:
       - drone-data-go:/data

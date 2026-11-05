@@ -2,6 +2,7 @@ package mavlink
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/bluenviron/gomavlib/v3"
@@ -13,7 +14,8 @@ const gcsSystemID = 255
 
 // ParseEndpoint turns a pymavlink-style connection string into a gomavlib endpoint,
 // so MAVLINK_CONNECTION keeps the same format as the Python service.
-// Supported: udpin:HOST:PORT, udpout:HOST:PORT, tcp:HOST:PORT, tcpin:HOST:PORT.
+// Supported: udpin:HOST:PORT, udpout:HOST:PORT, tcp:HOST:PORT, tcpin:HOST:PORT, serial:DEVICE:BAUD
+// (e.g. serial:/dev/ttyACM0:115200; the baud is the last field, so a device path may contain ':').
 func ParseEndpoint(conn string) (gomavlib.EndpointConf, error) {
 	scheme, addr, ok := strings.Cut(conn, ":")
 	if !ok || addr == "" {
@@ -29,6 +31,16 @@ func ParseEndpoint(conn string) (gomavlib.EndpointConf, error) {
 		return gomavlib.EndpointTCPClient{Address: addr}, nil
 	case "tcpin":
 		return gomavlib.EndpointTCPServer{Address: addr}, nil
+	case "serial":
+		i := strings.LastIndex(addr, ":")
+		if i <= 0 {
+			return nil, fmt.Errorf("connection string %q: want serial:DEVICE:BAUD", conn)
+		}
+		baud, err := strconv.Atoi(addr[i+1:])
+		if err != nil || baud <= 0 {
+			return nil, fmt.Errorf("connection string %q: baud %q is not a positive number", conn, addr[i+1:])
+		}
+		return gomavlib.EndpointSerial{Device: addr[:i], Baud: baud}, nil
 	}
 	return nil, fmt.Errorf("connection string %q: unknown scheme %q", conn, scheme)
 }

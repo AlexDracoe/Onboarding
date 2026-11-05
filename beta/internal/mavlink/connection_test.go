@@ -19,6 +19,10 @@ func TestParseEndpoint(t *testing.T) {
 		{"udp:127.0.0.1:14550", gomavlib.EndpointUDPClient{Address: "127.0.0.1:14550"}},
 		{"tcp:127.0.0.1:5760", gomavlib.EndpointTCPClient{Address: "127.0.0.1:5760"}},
 		{"tcpin:0.0.0.0:5760", gomavlib.EndpointTCPServer{Address: "0.0.0.0:5760"}},
+		{"serial:/dev/ttyACM0:115200", gomavlib.EndpointSerial{Device: "/dev/ttyACM0", Baud: 115200}},
+		{"serial:/dev/ttyUSB0:57600", gomavlib.EndpointSerial{Device: "/dev/ttyUSB0", Baud: 57600}},
+		{"serial:/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0:115200",
+			gomavlib.EndpointSerial{Device: "/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0", Baud: 115200}},
 	}
 	for _, tt := range tests {
 		got, err := ParseEndpoint(tt.conn)
@@ -33,7 +37,8 @@ func TestParseEndpoint(t *testing.T) {
 }
 
 func TestParseEndpointErrors(t *testing.T) {
-	for _, conn := range []string{"", "udpin", "udpin:", "serial:/dev/ttyUSB0", "14540"} {
+	for _, conn := range []string{"", "udpin", "udpin:", "serial:/dev/ttyUSB0", "serial:/dev/ttyUSB0:fast",
+		"serial:/dev/ttyUSB0:0", "serial::115200", "serial:115200", "14540"} {
 		if _, err := ParseEndpoint(conn); err == nil {
 			t.Errorf("%q: expected an error", conn)
 		}

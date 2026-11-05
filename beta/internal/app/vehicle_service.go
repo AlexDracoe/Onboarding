@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -15,6 +16,10 @@ var ErrStateTimeout = errors.New("state timeout")
 // CommandSender sends one command to a vehicle. Mavlink,sender implements it
 type CommandSender interface {
 	SendCommandLong(c domain.CommandLong) error
+}
+type CommandLog interface {
+	Create(systemID uint8, name string) (id string, err error)
+	UpdateStatus(id, status string, cmdErr error) error
 }
 
 // CommandSpec is one row of the command table
@@ -48,14 +53,50 @@ var commands = map[string]CommandSpec{
 }
 
 type VehicleService struct {
-	sm     *StateManager
-	acks   *AckTracker
-	sender CommandSender
-	cfg    config.Config
+	sm         *StateManager
+	acks       *AckTracker
+	sender     CommandSender
+	cfg        config.Config
+	commandLog CommandLog
 }
 
-func NewVehicleService(sm *StateManager, acks *AckTracker, sender CommandSender, cfg config.Config) *VehicleService {
-	return &VehicleService{sm: sm, acks: acks, sender: sender, cfg: cfg}
+func NewVehicleService(sm *StateManager, acks *AckTracker, sender CommandSender, commandLog CommandLog, cfg config.Config) *VehicleService {
+	return &VehicleService{sm: sm, acks: acks, sender: sender, commandLog: commandLog, cfg: cfg}
+}
+
+func (vs *VehicleService) Submit(systemID uint8, name string) (string, error) {
+	_, ok := commands[name]
+	if !ok {
+		return "", fmt.Errorf("%q: %w", name, ErrUnknownCommand)
+	}
+	id, err := vs.commandLog.Create(systemID, name)
+	if err != nil {
+		return "", fmt.Errorf("record %s for system %d: %w", name, systemID, err)
+	}
+	go vs.execute(id, systemID, name)
+
+	return id, nil
+}
+
+func (vs *VehicleService) execute(id string, systemID uint8, name string) {
+	status := "FAILED"
+	var cmdErr error
+
+	defer func() {
+		if r := recover(); r != nil {
+			status, cmdErr = "FAILED", fmt.Errorf("panic: %v", r)
+			log.Printf("command %s (%s on system %d) panicked: %v", id, name, systemID, r)
+		}
+		if err := vs.commandLog.UpdateStatus(id, status, cmdErr); err != nil {
+			log.Printf("command %s: could not record %s (%v): %v", id, status, cmdErr, err)
+		}
+	}()
+
+	cmdErr = vs.Execute(context.Background(), systemID, name)
+	status = StatusFor(cmdErr)
+	if cmdErr != nil {
+		log.Printf("command %s: %s: %v", id, status, cmdErr)
+	}
 }
 
 // Execute runs one command through the ACK stage nil means the vehicle accepted it

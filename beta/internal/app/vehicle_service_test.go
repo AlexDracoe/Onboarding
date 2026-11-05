@@ -1,8 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -60,8 +64,85 @@ func testConfig() config.Config {
 }
 
 func newTestService(f *fakeVehicle, cfg config.Config) *VehicleService {
+	vs, _ := newSubmitService(f, cfg)
+	return vs
+}
+
+func newSubmitService(f *fakeVehicle, cfg config.Config) (*VehicleService, *fakeLog) {
 	f.sm, f.at = NewStateManager(), NewAckTracker()
-	return NewVehicleService(f.sm, f.at, f, cfg)
+	fl := &fakeLog{rows: map[string]row{}}
+	return NewVehicleService(f.sm, f.at, f, fl, cfg), fl
+}
+
+// row is one command record in the fake log.
+type row struct {
+	systemID uint8
+	name     string
+	status   string
+	err      string // "" = NULL
+}
+
+// fakeLog is an in-memory CommandLog. createErr/updateErr make the "DB" fail.
+type fakeLog struct {
+	mu        sync.Mutex
+	rows      map[string]row
+	n         int
+	createErr error
+	updateErr error
+}
+
+func (l *fakeLog) Create(systemID uint8, name string) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.createErr != nil {
+		return "", l.createErr
+	}
+	l.n++
+	id := fmt.Sprintf("cmd-%d", l.n)
+	l.rows[id] = row{systemID: systemID, name: name, status: "PENDING"}
+	return id, nil
+}
+
+func (l *fakeLog) UpdateStatus(id, status string, cmdErr error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.updateErr != nil {
+		return l.updateErr
+	}
+	r := l.rows[id]
+	r.status, r.err = status, ""
+	if cmdErr != nil {
+		r.err = cmdErr.Error()
+	}
+	l.rows[id] = r
+	return nil
+}
+
+func (l *fakeLog) get(id string) (row, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r, ok := l.rows[id]
+	return r, ok
+}
+
+func (l *fakeLog) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.rows)
+}
+
+// finalRow waits (max 1s) until the row leaves PENDING and returns it.
+func finalRow(t *testing.T, l *fakeLog, id string) row {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if r, _ := l.get(id); r.status != "PENDING" {
+			return r
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("command %s still PENDING after 1s", id)
+	return row{}
 }
 
 // execute runs Execute with a hang guard and returns its error.
@@ -220,4 +301,159 @@ func TestStatusFor(t *testing.T) {
 			t.Errorf("StatusFor(%v) = %s, want %s", c.err, got, c.want)
 		}
 	}
+}
+
+func TestSubmitReturnsBeforeCommandFinishes(t *testing.T) {
+	f := &fakeVehicle{ackResult: "ACCEPTED", reachAt: 150 * time.Millisecond}
+	vs, fl := newSubmitService(f, testConfig())
+
+	start := time.Now()
+	id, err := vs.Submit(1, "arm")
+	if took := time.Since(start); took > 50*time.Millisecond {
+		t.Errorf("Submit took %v: it must return before the command finishes (missing go?)", took)
+	}
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if r, _ := fl.get(id); r.status != "PENDING" || r.systemID != 1 || r.name != "arm" {
+		t.Errorf("row right after Submit = %+v, want PENDING arm for system 1", r)
+	}
+	if r := finalRow(t, fl, id); r.status != "ACHIEVED" || r.err != "" {
+		t.Errorf("final row = %+v, want ACHIEVED with no error", r)
+	}
+}
+
+func TestSubmitFinalStatus(t *testing.T) {
+	for _, c := range []struct {
+		desc    string
+		f       *fakeVehicle
+		want    string
+		wantErr string // substring of the stored error, "" = must be NULL
+	}{
+		{"achieved", &fakeVehicle{ackResult: "ACCEPTED", reachAt: 0}, "ACHIEVED", ""},
+		{"rejected", &fakeVehicle{ackResult: "DENIED", reachAt: -1}, "COMMAND_REJECTED", "DENIED"},
+		{"no ack", &fakeVehicle{reachAt: -1}, "ACK_TIMEOUT", "no ACK"},
+		{"never armed", &fakeVehicle{ackResult: "ACCEPTED", reachAt: -1}, "STATE_TIMEOUT", "armed on system 1"},
+		{"send fails", &fakeVehicle{err: errors.New("link down")}, "FAILED", "link down"},
+	} {
+		t.Run(c.desc, func(t *testing.T) {
+			vs, fl := newSubmitService(c.f, testConfig())
+			id, err := vs.Submit(1, "arm")
+			if err != nil {
+				t.Fatalf("Submit: %v", err)
+			}
+			r := finalRow(t, fl, id)
+			if r.status != c.want {
+				t.Errorf("status = %s (err %q), want %s", r.status, r.err, c.want)
+			}
+			if c.wantErr == "" && r.err != "" {
+				t.Errorf("error column = %q, want NULL", r.err)
+			}
+			if c.wantErr != "" && !strings.Contains(r.err, c.wantErr) {
+				t.Errorf("error column = %q, want it to mention %q", r.err, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestSubmitUnknownCommandLeavesNoRow(t *testing.T) {
+	f := &fakeVehicle{ackResult: "ACCEPTED"}
+	vs, fl := newSubmitService(f, testConfig())
+	id, err := vs.Submit(1, "fly")
+	if !errors.Is(err, ErrUnknownCommand) || id != "" {
+		t.Errorf("got (%q, %v), want (\"\", ErrUnknownCommand)", id, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if fl.count() != 0 || f.sentCount() != 0 {
+		t.Errorf("rows=%d sent=%d, want 0 and 0", fl.count(), f.sentCount())
+	}
+}
+
+func TestSubmitCreateFailsStartsNothing(t *testing.T) {
+	f := &fakeVehicle{ackResult: "ACCEPTED", reachAt: 0}
+	vs, fl := newSubmitService(f, testConfig())
+	dbErr := errors.New("disk full")
+	fl.createErr = dbErr
+
+	id, err := vs.Submit(1, "arm")
+	if !errors.Is(err, dbErr) || id != "" {
+		t.Errorf("got (%q, %v), want (\"\", wrapped disk full)", id, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := f.sentCount(); n != 0 {
+		t.Errorf("sent %d commands although the row was never created", n)
+	}
+}
+
+type panickingSender struct{}
+
+func (panickingSender) SendCommandLong(domain.CommandLong) error {
+	var m map[string]int
+	m["boom"] = 1 // nil map write: panics
+	return nil
+}
+
+func TestPanicEndsAsFailedNotPending(t *testing.T) {
+	fl := &fakeLog{rows: map[string]row{}}
+	vs := NewVehicleService(NewStateManager(), NewAckTracker(), panickingSender{}, fl, testConfig())
+	logs := captureLog(t)
+
+	id, err := vs.Submit(1, "arm")
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	r := finalRow(t, fl, id)
+	if r.status != "FAILED" || !strings.Contains(r.err, "panic") {
+		t.Errorf("row = %+v, want FAILED with a panic error", r)
+	}
+	if !strings.Contains(logs.String(), "panicked") {
+		t.Errorf("panic not logged; log was %q", logs.String())
+	}
+}
+
+// When the final write itself fails, both the DB error and the command's error must reach the log.
+func TestUpdateStatusFailureIsLogged(t *testing.T) {
+	f := &fakeVehicle{err: errors.New("link down")}
+	vs, fl := newSubmitService(f, testConfig())
+	fl.updateErr = errors.New("db locked")
+	logs := captureLog(t)
+
+	if _, err := vs.Submit(1, "arm"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(logs.String(), "db locked") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "db locked") || !strings.Contains(out, "link down") {
+		t.Errorf("log should mention the DB error and the command error; got %q", out)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the log package and the test to share.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// captureLog sends the standard logger to a buffer for the rest of the test.
+func captureLog(t *testing.T) *syncBuffer {
+	buf := &syncBuffer{}
+	old := log.Writer()
+	log.SetOutput(buf)
+	t.Cleanup(func() { log.SetOutput(old) })
+	return buf
 }

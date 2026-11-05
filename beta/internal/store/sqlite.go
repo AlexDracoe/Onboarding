@@ -66,11 +66,20 @@ func (s *SQLite) Close() error {
 	return s.db.Close()
 }
 
-// Create inserts a PENDING row and returns its new id.
-func (s *SQLite) Create(systemID uint8, name string) (string, error) {
-	cmd, err := json.Marshal(map[string]any{"name": name, "params": map[string]any{}})
+// storedCmd is the cmd column: {"name": ..., "params": {...}} in that key order.
+type storedCmd struct {
+	Name   string `json:"name"`
+	Params any    `json:"params"`
+}
+
+// Create inserts a PENDING row and returns its new id. params is the decoded params struct; nil stores {}.
+func (s *SQLite) Create(systemID uint8, name string, params any) (string, error) {
+	if params == nil {
+		params = struct{}{}
+	}
+	cmd, err := json.Marshal(storedCmd{Name: name, Params: params})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("encode params for %s: %w", name, err)
 	}
 	id := uuid.NewString()
 	now := unixSeconds(time.Now())

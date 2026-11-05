@@ -28,7 +28,7 @@ type vehicleSource interface {
 }
 
 type commandSubmitter interface {
-	Submit(systemID uint8, name string) (string, error)
+	Submit(systemID uint8, name string, body []byte) (string, error)
 }
 
 type commandRecords interface {
@@ -70,14 +70,19 @@ func (s *server) submitCommand(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := readParams(r); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "INVALID_PARAMS", err.Error())
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "INVALID_PARAMS", "body: "+err.Error())
 		return
 	}
-	// TODO(5c part 2): pass the params to Submit and map its validation error to 422 INVALID_PARAMS.
 
 	name := r.PathValue("name")
-	id, err := s.commands.Submit(systemID, name)
+	id, err := s.commands.Submit(systemID, name, body)
+	var invalid *app.ParamsError
+	if errors.As(err, &invalid) {
+		writeError(w, http.StatusUnprocessableEntity, "INVALID_PARAMS", invalid.Error())
+		return
+	}
 	if errors.Is(err, app.ErrUnknownCommand) {
 		writeError(w, http.StatusNotFound, "UNKNOWN_COMMAND", "Unknown command: "+name)
 		return
@@ -150,22 +155,6 @@ func (s *server) getCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
-}
-
-// readParams decodes the optional JSON body. No body means no params; anything else must be a JSON object.
-func readParams(r *http.Request) (map[string]any, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
-	if err != nil {
-		return nil, fmt.Errorf("body: %v", err)
-	}
-	params := map[string]any{}
-	if len(body) == 0 {
-		return params, nil
-	}
-	if err := json.Unmarshal(body, &params); err != nil || params == nil {
-		return nil, errors.New("body: must be a JSON object")
-	}
-	return params, nil
 }
 
 // pathSystemID parses {system_id}; on failure it writes the 422 and returns ok == false.

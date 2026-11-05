@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"time"
 )
 
@@ -18,14 +19,24 @@ type CommandSender interface {
 	SendCommandLong(c domain.CommandLong) error
 }
 type CommandLog interface {
-	Create(systemID uint8, name string) (id string, err error)
+	Create(systemID uint8, name string, params any) (id string, err error)
 	UpdateStatus(id, status string, cmdErr error) error
+}
+
+type request struct {
+	SystemID uint8
+	Body     []byte
+}
+
+type Bound struct {
+	Params    any
+	Msg       domain.CommandLong
+	Predicate func(s domain.VehicleState) bool
 }
 
 // CommandSpec is one row of the command table
 type CommandSpec struct {
-	Build       func(systemID uint8) domain.CommandLong
-	Predicate   func(s domain.VehicleState) bool
+	Prepare     func(r request) (Bound, error)
 	Description string
 	Timeout     time.Duration
 }
@@ -33,22 +44,57 @@ type CommandSpec struct {
 // commands is the command table 5b adds a predicate and state timeout, 5c adds paramsss
 var commands = map[string]CommandSpec{
 	"arm": {
-		Build: func(id uint8) domain.CommandLong {
-			return domain.CommandLong{SystemID: id, Command: "COMPONENT_ARM_DISARM", Param1: 1}
-		},
-		Predicate: func(s domain.VehicleState) bool {
-			return s.IsArmed != nil && *s.IsArmed
+		Prepare: func(r request) (Bound, error) {
+			var p NoParams
+			if err := decodeStrict(r.Body, &p); err != nil {
+				return Bound{}, err // Bound{} = zero value, like returning "" with an error
+			}
+			return Bound{
+				Params: p,
+				Msg:    domain.CommandLong{SystemID: r.SystemID, Command: "COMPONENT_ARM_DISARM", Param1: 1},
+				Predicate: func(s domain.VehicleState) bool {
+					return s.IsArmed != nil && *s.IsArmed
+				},
+			}, nil
 		},
 		Description: "armed",
 	},
 	"disarm": {
-		Build: func(id uint8) domain.CommandLong {
-			return domain.CommandLong{SystemID: id, Command: "COMPONENT_ARM_DISARM", Param1: 0}
-		},
-		Predicate: func(s domain.VehicleState) bool {
-			return s.IsArmed != nil && !*s.IsArmed
+		Prepare: func(r request) (Bound, error) {
+			var p NoParams
+			if err := decodeStrict(r.Body, &p); err != nil {
+				return Bound{}, err
+			}
+			return Bound{
+				Params: p,
+				Msg:    domain.CommandLong{SystemID: r.SystemID, Command: "COMPONENT_ARM_DISARM", Param1: 0},
+				Predicate: func(s domain.VehicleState) bool {
+					return s.IsArmed != nil && !*s.IsArmed
+				},
+			}, nil
 		},
 		Description: "disarmed",
+	},
+	"takeoff": {
+		Prepare: func(r request) (Bound, error) {
+			var p TakeOffParams
+			if err := decodeStrict(r.Body, &p); err != nil {
+				return Bound{}, err
+			}
+			if err := p.validate(); err != nil {
+				return Bound{}, err
+			}
+			alt := *p.Altitude
+			return Bound{
+				Params: p,
+				Msg:    domain.CommandLong{SystemID: r.SystemID, Command: "NAV_TAKEOFF", Param4: float32(math.NaN()), Param7: float32(alt)},
+				Predicate: func(s domain.VehicleState) bool {
+					return s.Position != nil && s.Position.RelativeAltitude >= 0.9*alt
+				},
+			}, nil
+		},
+		Description: "took off",
+		Timeout:     30 * time.Second,
 	},
 }
 
@@ -64,21 +110,25 @@ func NewVehicleService(sm *StateManager, acks *AckTracker, sender CommandSender,
 	return &VehicleService{sm: sm, acks: acks, sender: sender, commandLog: commandLog, cfg: cfg}
 }
 
-func (vs *VehicleService) Submit(systemID uint8, name string) (string, error) {
-	_, ok := commands[name]
+func (vs *VehicleService) Submit(systemID uint8, name string, body []byte) (string, error) {
+	spec, ok := commands[name]
 	if !ok {
 		return "", fmt.Errorf("%q: %w", name, ErrUnknownCommand)
 	}
-	id, err := vs.commandLog.Create(systemID, name)
+	b, err := spec.Prepare(request{SystemID: systemID, Body: body})
+	if err != nil {
+		return "", err
+	}
+	id, err := vs.commandLog.Create(systemID, name, b.Params)
 	if err != nil {
 		return "", fmt.Errorf("record %s for system %d: %w", name, systemID, err)
 	}
-	go vs.execute(id, systemID, name)
+	go vs.execute(id, systemID, name, spec, b)
 
 	return id, nil
 }
 
-func (vs *VehicleService) execute(id string, systemID uint8, name string) {
+func (vs *VehicleService) execute(id string, systemID uint8, name string, spec CommandSpec, b Bound) {
 	status := "FAILED"
 	var cmdErr error
 
@@ -92,28 +142,23 @@ func (vs *VehicleService) execute(id string, systemID uint8, name string) {
 		}
 	}()
 
-	cmdErr = vs.Execute(context.Background(), systemID, name)
+	// TODO(phase 8): use the service's root ctx instead of Background.
+	cmdErr = vs.Execute(context.Background(), systemID, spec, b)
 	status = StatusFor(cmdErr)
 	if cmdErr != nil {
 		log.Printf("command %s: %s: %v", id, status, cmdErr)
 	}
 }
 
-// Execute runs one command through the ACK stage nil means the vehicle accepted it
-func (vs *VehicleService) Execute(ctx context.Context, systemID uint8, name string) error {
-	spec, ok := commands[name]
-	if !ok {
-		return fmt.Errorf("%q: %w", name, ErrUnknownCommand)
-	}
-	msg := spec.Build(systemID)
-
-	p, err := vs.acks.Register(systemID, msg.Command)
+// Execute runs one bound command: register, send, wait for the ACK, then for the predicate.
+func (vs *VehicleService) Execute(ctx context.Context, systemID uint8, spec CommandSpec, b Bound) error {
+	p, err := vs.acks.Register(systemID, b.Msg.Command)
 	if err != nil {
 		return err
 	}
-	if err := vs.sender.SendCommandLong(msg); err != nil {
+	if err := vs.sender.SendCommandLong(b.Msg); err != nil {
 		vs.acks.discard(p)
-		return fmt.Errorf("send %s to system %d: %w", name, systemID, err)
+		return fmt.Errorf("send %s to system %d: %w", b.Msg.Command, systemID, err)
 	}
 
 	_, err = vs.acks.WaitForAck(p, vs.cfg.AckTimeout)
@@ -128,11 +173,10 @@ func (vs *VehicleService) Execute(ctx context.Context, systemID uint8, name stri
 	stateCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	if err := vs.waitForState(stateCtx, systemID, spec.Predicate); err != nil {
+	if err := vs.waitForState(stateCtx, systemID, b.Predicate); err != nil {
 		return fmt.Errorf("%s on system %d after %v: %w", spec.Description, systemID, timeout, err)
 	}
 	return nil
-
 }
 
 func (vs *VehicleService) waitForState(ctx context.Context, systemID uint8, predicate func(s domain.VehicleState) bool) error {

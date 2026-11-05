@@ -23,7 +23,7 @@ func TestCreateGetUpdate(t *testing.T) {
 	s := openTemp(t)
 	before := float64(time.Now().Unix()) - 1
 
-	id, err := s.Create(3, "arm")
+	id, err := s.Create(3, "arm", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestListOrderFilterLimit(t *testing.T) {
 
 	var ids []string
 	for i, sys := range []uint8{1, 2, 1, 1} {
-		id, err := s.Create(sys, []string{"arm", "arm", "disarm", "arm"}[i])
+		id, err := s.Create(sys, []string{"arm", "arm", "disarm", "arm"}[i], nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -100,7 +100,7 @@ func TestListOrderFilterLimit(t *testing.T) {
 
 func TestRecordJSON(t *testing.T) {
 	s := openTemp(t)
-	id, _ := s.Create(1, "disarm")
+	id, _ := s.Create(1, "disarm", nil)
 	rec, _, _ := s.Get(id)
 	b, _ := json.Marshal(rec)
 
@@ -123,7 +123,7 @@ func TestConcurrentWriters(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Go(func() {
-			id, err := s.Create(1, "arm")
+			id, err := s.Create(1, "arm", nil)
 			if err != nil {
 				t.Error(err)
 				return
@@ -177,4 +177,22 @@ func recordIDs(recs []Record) []string {
 		ids = append(ids, r.ID[:8])
 	}
 	return ids
+}
+
+func TestCreateStoresParams(t *testing.T) {
+	s := openTemp(t)
+	alt := 10.0
+	id, err := s.Create(1, "takeoff", struct {
+		Altitude *float64 `json:"altitude"`
+	}{&alt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _, _ := s.Get(id)
+	if string(rec.Cmd) != `{"name":"takeoff","params":{"altitude":10}}` {
+		t.Errorf("cmd = %s", rec.Cmd)
+	}
+	if _, err := s.Create(1, "bad", func() {}); err == nil {
+		t.Error("Create with unencodable params: want an error")
+	}
 }

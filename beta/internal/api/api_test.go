@@ -26,10 +26,11 @@ type fakeSubmitter struct {
 	err       error
 	gotSystem uint8
 	gotName   string
+	gotBody   string
 }
 
-func (f *fakeSubmitter) Submit(systemID uint8, name string) (string, error) {
-	f.gotSystem, f.gotName = systemID, name
+func (f *fakeSubmitter) Submit(systemID uint8, name string, body []byte) (string, error) {
+	f.gotSystem, f.gotName, f.gotBody = systemID, name, string(body)
 	if f.err != nil {
 		return "", f.err
 	}
@@ -115,9 +116,8 @@ func TestSubmitErrors(t *testing.T) {
 		{"unknown command", "/vehicles/1/commands/fly", "", fmt.Errorf("%q: %w", "fly", app.ErrUnknownCommand), 404, "UNKNOWN_COMMAND"},
 		{"bad system id", "/vehicles/abc/commands/arm", "", nil, 422, "INVALID_PARAMS"},
 		{"system id too big", "/vehicles/256/commands/arm", "", nil, 422, "INVALID_PARAMS"},
-		{"body not JSON", "/vehicles/1/commands/arm", "altitude=10", nil, 422, "INVALID_PARAMS"},
-		{"body not an object", "/vehicles/1/commands/arm", "[1,2]", nil, 422, "INVALID_PARAMS"},
-		{"body null", "/vehicles/1/commands/arm", "null", nil, 422, "INVALID_PARAMS"},
+		{"invalid params", "/vehicles/1/commands/takeoff", `{"altitude": 500}`, &app.ParamsError{Problems: []string{"altitude: too high"}}, 422, "INVALID_PARAMS"},
+		{"invalid params, wrapped", "/vehicles/1/commands/takeoff", "", fmt.Errorf("x: %w", &app.ParamsError{Problems: []string{"a: b"}}), 422, "INVALID_PARAMS"},
 		{"db down", "/vehicles/1/commands/arm", "", errors.New("disk full"), 500, "INTERNAL"},
 	} {
 		t.Run(c.desc, func(t *testing.T) {
@@ -216,5 +216,59 @@ func TestRealStackRoundTrip(t *testing.T) {
 	}
 	if _, body := do(t, h, "GET", "/commands?system_id=1", ""); !strings.Contains(body, accepted["command_id"]) {
 		t.Errorf("history does not list the command: %s", body)
+	}
+}
+
+// The raw body reaches Submit unchanged; a ParamsError's detail is exactly its joined problems.
+func TestSubmitPassesBodyAndDetail(t *testing.T) {
+	sub := &fakeSubmitter{}
+	h, _ := newTestServer(sub, &fakeRecords{})
+	if code, _ := do(t, h, "POST", "/vehicles/1/commands/takeoff", `{"altitude": 10}`); code != 202 || sub.gotBody != `{"altitude": 10}` {
+		t.Errorf("got %d, Submit saw body %q", code, sub.gotBody)
+	}
+	sub.err = &app.ParamsError{Problems: []string{"lat: too big", "long: too small"}}
+	_, body := do(t, h, "POST", "/vehicles/1/commands/goto", `{}`)
+	if body != `{"error":"INVALID_PARAMS","detail":"lat: too big;long: too small"}` {
+		t.Errorf("body = %s", body)
+	}
+}
+
+// Real VehicleService behind the handler: body validation happens in app and comes back as 422.
+func TestRealStackInvalidParams(t *testing.T) {
+	db, err := store.Open(t.TempDir() + "/drone.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	sm, at := app.NewStateManager(), app.NewAckTracker()
+	h := NewHandler(sm, app.NewVehicleService(sm, at, silentSender{}, db, testConfig()), db)
+
+	for _, c := range []struct{ path, body, detail string }{
+		{"/vehicles/1/commands/arm", "altitude=10", "body:"},
+		{"/vehicles/1/commands/arm", "[1,2]", "body:"},
+		{"/vehicles/1/commands/arm", "null", "body: must be a JSON object"},
+		{"/vehicles/1/commands/arm", `{"x": 1}`, `unknown field \"x\"`},
+		{"/vehicles/1/commands/takeoff", "", "altitude: required"},
+		{"/vehicles/1/commands/takeoff", `{"altitude": 150}`, "altitude: must be between 2 and 100"},
+	} {
+		code, body := do(t, h, "POST", c.path, c.body)
+		wantError(t, code, body, 422, "INVALID_PARAMS")
+		if !strings.Contains(body, c.detail) {
+			t.Errorf("POST %s %s: body %s, want detail mentioning %s", c.path, c.body, body, c.detail)
+		}
+	}
+	if recs, _ := db.List(nil, 50); len(recs) != 0 {
+		t.Errorf("%d rows written for rejected bodies, want 0", len(recs))
+	}
+
+	code, body := do(t, h, "POST", "/vehicles/1/commands/takeoff", `{"altitude": 10}`)
+	var accepted map[string]string
+	json.Unmarshal([]byte(body), &accepted)
+	if code != 202 {
+		t.Fatalf("valid takeoff = %d %s", code, body)
+	}
+	rec, _, _ := db.Get(accepted["command_id"])
+	if string(rec.Cmd) != `{"name":"takeoff","params":{"altitude":10}}` {
+		t.Errorf("stored cmd = %s, want name + decoded params", rec.Cmd)
 	}
 }

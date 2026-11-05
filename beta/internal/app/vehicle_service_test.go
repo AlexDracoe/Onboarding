@@ -3,9 +3,11 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -43,10 +45,21 @@ func (f *fakeVehicle) SendCommandLong(c domain.CommandLong) error {
 	if f.reachAt >= 0 {
 		go func() {
 			time.Sleep(f.reachAt)
+			if c.Command == "NAV_TAKEOFF" { // climb straight to the commanded altitude
+				f.sm.Apply(domain.GlobalPositionIntUpdate{SystemID: c.SystemID,
+					Position: domain.Position{RelativeAltitude: float64(c.Param7)}})
+				return
+			}
 			f.sm.Apply(domain.HeartbeatUpdate{SystemID: c.SystemID, IsArmed: c.Param1 == 1})
 		}()
 	}
 	return nil
+}
+
+func (f *fakeVehicle) lastSent() domain.CommandLong {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sent[len(f.sent)-1]
 }
 
 func (f *fakeVehicle) sentCount() int {
@@ -78,6 +91,7 @@ func newSubmitService(f *fakeVehicle, cfg config.Config) (*VehicleService, *fake
 type row struct {
 	systemID uint8
 	name     string
+	params   string // cmd.params as JSON
 	status   string
 	err      string // "" = NULL
 }
@@ -91,15 +105,19 @@ type fakeLog struct {
 	updateErr error
 }
 
-func (l *fakeLog) Create(systemID uint8, name string) (string, error) {
+func (l *fakeLog) Create(systemID uint8, name string, params any) (string, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.createErr != nil {
 		return "", l.createErr
 	}
+	b, err := json.Marshal(params)
+	if err != nil {
+		return "", err
+	}
 	l.n++
 	id := fmt.Sprintf("cmd-%d", l.n)
-	l.rows[id] = row{systemID: systemID, name: name, status: "PENDING"}
+	l.rows[id] = row{systemID: systemID, name: name, params: string(b), status: "PENDING"}
 	return id, nil
 }
 
@@ -145,11 +163,31 @@ func finalRow(t *testing.T, l *fakeLog, id string) row {
 	return row{}
 }
 
-// execute runs Execute with a hang guard and returns its error.
+// prepare runs the table's Prepare for name with body and fails the test on an error.
+func prepare(t *testing.T, name string, systemID uint8, body string) (CommandSpec, Bound) {
+	t.Helper()
+	spec, ok := commands[name]
+	if !ok {
+		t.Fatalf("no %q in the command table", name)
+	}
+	b, err := spec.Prepare(request{SystemID: systemID, Body: []byte(body)})
+	if err != nil {
+		t.Fatalf("Prepare %s %s: %v", name, body, err)
+	}
+	return spec, b
+}
+
+// execute prepares name with an empty body and runs Execute with a hang guard.
 func execute(t *testing.T, vs *VehicleService, systemID uint8, name string) error {
 	t.Helper()
+	return executeCtx(t, context.Background(), vs, systemID, name, "")
+}
+
+func executeCtx(t *testing.T, ctx context.Context, vs *VehicleService, systemID uint8, name, body string) error {
+	t.Helper()
+	spec, b := prepare(t, name, systemID, body)
 	var err error
-	returnsWithin(t, "Execute "+name, func() { err = vs.Execute(context.Background(), systemID, name) })
+	returnsWithin(t, "Execute "+name, func() { err = vs.Execute(ctx, systemID, spec, b) })
 	return err
 }
 
@@ -158,10 +196,12 @@ func TestTableBuildsArmDisarm(t *testing.T) {
 		name   string
 		param1 float32
 	}{{"arm", 1}, {"disarm", 0}} {
-		msg := commands[c.name].Build(7)
-		want := domain.CommandLong{SystemID: 7, Command: "COMPONENT_ARM_DISARM", Param1: c.param1}
-		if msg != want {
-			t.Errorf("%s: got %+v, want %+v", c.name, msg, want)
+		for _, body := range []string{"", "{}", " {} "} {
+			_, b := prepare(t, c.name, 7, body)
+			want := domain.CommandLong{SystemID: 7, Command: "COMPONENT_ARM_DISARM", Param1: c.param1}
+			if b.Msg != want {
+				t.Errorf("%s %q: got %+v, want %+v", c.name, body, b.Msg, want)
+			}
 		}
 	}
 }
@@ -180,10 +220,87 @@ func TestArmDisarmPredicates(t *testing.T) {
 		{"disarm", &yes, false},
 		{"disarm", &no, true},
 	} {
-		got := commands[c.name].Predicate(domain.VehicleState{IsArmed: c.isArmed})
+		_, b := prepare(t, c.name, 1, "")
+		got := b.Predicate(domain.VehicleState{IsArmed: c.isArmed})
 		if got != c.want {
 			t.Errorf("%s predicate with IsArmed=%v: got %v, want %v", c.name, c.isArmed, got, c.want)
 		}
+	}
+}
+
+func TestTakeoffBuild(t *testing.T) {
+	_, b := prepare(t, "takeoff", 3, `{"altitude": 10}`)
+	m := b.Msg
+	if m.SystemID != 3 || m.Command != "NAV_TAKEOFF" || m.Param7 != 10 {
+		t.Errorf("msg = %+v, want NAV_TAKEOFF for system 3 with Param7 10", m)
+	}
+	if !math.IsNaN(float64(m.Param4)) {
+		t.Errorf("Param4 = %v, want NaN (yaw: don't care)", m.Param4)
+	}
+	if m.Param1 != 0 || m.Param2 != 0 || m.Param3 != 0 || m.Param5 != 0 || m.Param6 != 0 {
+		t.Errorf("msg = %+v, want params 1-3, 5, 6 zero", m)
+	}
+	for _, body := range []string{`{"altitude": 2}`, `{"altitude": 100}`} {
+		prepare(t, "takeoff", 1, body) // the range ends are allowed
+	}
+}
+
+func TestTakeoffPredicate(t *testing.T) {
+	_, b := prepare(t, "takeoff", 1, `{"altitude": 10}`)
+	at := func(alt float64) domain.VehicleState {
+		return domain.VehicleState{Position: &domain.Position{RelativeAltitude: alt}}
+	}
+	for _, c := range []struct {
+		desc string
+		s    domain.VehicleState
+		want bool
+	}{
+		{"no position yet", domain.VehicleState{}, false}, // must not panic
+		{"on the ground", at(0), false},
+		{"just below 90%", at(8.9), false},
+		{"at 90%", at(9), true},
+		{"above", at(12), true},
+	} {
+		if got := b.Predicate(c.s); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.desc, got, c.want)
+		}
+	}
+}
+
+func TestPrepareRejectsBadParams(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		want       string // substring of the 422 detail
+	}{
+		{"arm", `{"altitude": 10}`, `unknown field "altitude"`},
+		{"arm", `[1, 2]`, "body:"},
+		{"arm", `null`, "body: must be a JSON object"},
+		{"arm", `nope`, "body:"},
+		{"disarm", `{"x": 1}`, `unknown field "x"`},
+		{"takeoff", ``, "altitude: required"},
+		{"takeoff", `{}`, "altitude: required"},
+		{"takeoff", `{"altitude": null}`, "altitude: required"},
+		{"takeoff", `{"altitude": 1.9}`, "altitude: must be between 2 and 100"},
+		{"takeoff", `{"altitude": 100.5}`, "altitude: must be between 2 and 100"},
+		{"takeoff", `{"altitude": "10"}`, "body:"},
+		{"takeoff", `{"altitde": 10}`, `unknown field "altitde"`},
+	} {
+		_, err := commands[c.name].Prepare(request{SystemID: 1, Body: []byte(c.body)})
+		var pe *ParamsError
+		if !errors.As(err, &pe) {
+			t.Errorf("%s %s: got %v, want a *ParamsError", c.name, c.body, err)
+			continue
+		}
+		if !strings.Contains(pe.Error(), c.want) {
+			t.Errorf("%s %s: detail %q, want it to mention %q", c.name, c.body, pe.Error(), c.want)
+		}
+	}
+}
+
+func TestParamsErrorJoinsWithSemicolon(t *testing.T) {
+	err := &ParamsError{Problems: []string{"lat: too big", "long: too small"}}
+	if got := err.Error(); got != "lat: too big;long: too small" {
+		t.Errorf("got %q", got)
 	}
 }
 
@@ -201,7 +318,6 @@ func TestExecuteOutcomes(t *testing.T) {
 		{"no ack", &fakeVehicle{reachAt: -1}, "arm", "ACK_TIMEOUT"},
 		{"accepted, never armed", &fakeVehicle{ackResult: "ACCEPTED", reachAt: -1}, "arm", "STATE_TIMEOUT"},
 		{"send fails", &fakeVehicle{err: errors.New("link down")}, "arm", "FAILED"},
-		{"unknown command", &fakeVehicle{ackResult: "ACCEPTED"}, "fly", "FAILED"},
 	} {
 		t.Run(c.desc, func(t *testing.T) {
 			vs := newTestService(c.f, testConfig())
@@ -213,17 +329,6 @@ func TestExecuteOutcomes(t *testing.T) {
 				t.Errorf("%d entries left in the AckTracker", n)
 			}
 		})
-	}
-}
-
-func TestUnknownCommandSendsNothing(t *testing.T) {
-	f := &fakeVehicle{ackResult: "ACCEPTED"}
-	err := execute(t, newTestService(f, testConfig()), 1, "fly")
-	if !errors.Is(err, ErrUnknownCommand) {
-		t.Errorf("got %v, want ErrUnknownCommand", err)
-	}
-	if n := f.sentCount(); n != 0 {
-		t.Errorf("sent %d messages for an unknown command", n)
 	}
 }
 
@@ -278,8 +383,7 @@ func TestCallerCancelStopsWait(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	var err error
-	returnsWithin(t, "Execute with a cancelled parent", func() { err = vs.Execute(ctx, 1, "arm") })
+	err := executeCtx(t, ctx, vs, 1, "arm", "")
 	if !errors.Is(err, ErrStateTimeout) {
 		t.Errorf("got %v, want ErrStateTimeout", err)
 	}
@@ -308,7 +412,7 @@ func TestSubmitReturnsBeforeCommandFinishes(t *testing.T) {
 	vs, fl := newSubmitService(f, testConfig())
 
 	start := time.Now()
-	id, err := vs.Submit(1, "arm")
+	id, err := vs.Submit(1, "arm", nil)
 	if took := time.Since(start); took > 50*time.Millisecond {
 		t.Errorf("Submit took %v: it must return before the command finishes (missing go?)", took)
 	}
@@ -338,7 +442,7 @@ func TestSubmitFinalStatus(t *testing.T) {
 	} {
 		t.Run(c.desc, func(t *testing.T) {
 			vs, fl := newSubmitService(c.f, testConfig())
-			id, err := vs.Submit(1, "arm")
+			id, err := vs.Submit(1, "arm", nil)
 			if err != nil {
 				t.Fatalf("Submit: %v", err)
 			}
@@ -359,7 +463,7 @@ func TestSubmitFinalStatus(t *testing.T) {
 func TestSubmitUnknownCommandLeavesNoRow(t *testing.T) {
 	f := &fakeVehicle{ackResult: "ACCEPTED"}
 	vs, fl := newSubmitService(f, testConfig())
-	id, err := vs.Submit(1, "fly")
+	id, err := vs.Submit(1, "fly", nil)
 	if !errors.Is(err, ErrUnknownCommand) || id != "" {
 		t.Errorf("got (%q, %v), want (\"\", ErrUnknownCommand)", id, err)
 	}
@@ -375,7 +479,7 @@ func TestSubmitCreateFailsStartsNothing(t *testing.T) {
 	dbErr := errors.New("disk full")
 	fl.createErr = dbErr
 
-	id, err := vs.Submit(1, "arm")
+	id, err := vs.Submit(1, "arm", nil)
 	if !errors.Is(err, dbErr) || id != "" {
 		t.Errorf("got (%q, %v), want (\"\", wrapped disk full)", id, err)
 	}
@@ -398,7 +502,7 @@ func TestPanicEndsAsFailedNotPending(t *testing.T) {
 	vs := NewVehicleService(NewStateManager(), NewAckTracker(), panickingSender{}, fl, testConfig())
 	logs := captureLog(t)
 
-	id, err := vs.Submit(1, "arm")
+	id, err := vs.Submit(1, "arm", nil)
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
@@ -418,7 +522,7 @@ func TestUpdateStatusFailureIsLogged(t *testing.T) {
 	fl.updateErr = errors.New("db locked")
 	logs := captureLog(t)
 
-	if _, err := vs.Submit(1, "arm"); err != nil {
+	if _, err := vs.Submit(1, "arm", nil); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
 	deadline := time.Now().Add(time.Second)
@@ -456,4 +560,71 @@ func captureLog(t *testing.T) *syncBuffer {
 	log.SetOutput(buf)
 	t.Cleanup(func() { log.SetOutput(old) })
 	return buf
+}
+
+func TestSubmitInvalidParamsLeavesNoRow(t *testing.T) {
+	f := &fakeVehicle{ackResult: "ACCEPTED", reachAt: 0}
+	vs, fl := newSubmitService(f, testConfig())
+	id, err := vs.Submit(1, "takeoff", []byte(`{"altitude": 500}`))
+	var pe *ParamsError
+	if !errors.As(err, &pe) || id != "" {
+		t.Errorf("got (%q, %v), want (\"\", *ParamsError)", id, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if fl.count() != 0 || f.sentCount() != 0 {
+		t.Errorf("rows=%d sent=%d, want 0 and 0", fl.count(), f.sentCount())
+	}
+}
+
+func TestSubmitStoresDecodedParams(t *testing.T) {
+	for _, c := range []struct {
+		name, body, want string
+	}{
+		{"arm", "", "{}"},
+		{"arm", "{}", "{}"},
+		{"takeoff", `{ "altitude" : 10.0 }`, `{"altitude":10}`},
+	} {
+		f := &fakeVehicle{ackResult: "ACCEPTED", reachAt: 0}
+		vs, fl := newSubmitService(f, testConfig())
+		id, err := vs.Submit(1, c.name, []byte(c.body))
+		if err != nil {
+			t.Fatalf("Submit %s %s: %v", c.name, c.body, err)
+		}
+		if r, _ := fl.get(id); r.params != c.want {
+			t.Errorf("%s %s: stored params %s, want %s", c.name, c.body, r.params, c.want)
+		}
+		finalRow(t, fl, id)
+	}
+}
+
+func TestSubmitTakeoffAchieved(t *testing.T) {
+	f := &fakeVehicle{ackResult: "IN_PROGRESS", reachAt: 30 * time.Millisecond}
+	vs, fl := newSubmitService(f, testConfig())
+	id, err := vs.Submit(1, "takeoff", []byte(`{"altitude": 10}`))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if r := finalRow(t, fl, id); r.status != "ACHIEVED" {
+		t.Errorf("final row = %+v, want ACHIEVED", r)
+	}
+	if m := f.lastSent(); m.Command != "NAV_TAKEOFF" || m.Param7 != 10 {
+		t.Errorf("sent %+v, want NAV_TAKEOFF to 10 m", m)
+	}
+}
+
+// takeoff has its own 30 s state timeout; it must not fall back to the (short) default.
+func TestTakeoffUsesItsOwnTimeout(t *testing.T) {
+	if got := commands["takeoff"].Timeout; got != 30*time.Second {
+		t.Errorf("takeoff timeout = %v, want 30s", got)
+	}
+}
+
+// The vehicle is known but stays disarmed: only the bound predicate can tell it is not done.
+func TestKnownVehicleWrongStateTimesOut(t *testing.T) {
+	f := &fakeVehicle{ackResult: "ACCEPTED", reachAt: -1}
+	vs := newTestService(f, testConfig())
+	f.sm.Apply(domain.HeartbeatUpdate{SystemID: 1, IsArmed: false})
+	if err := execute(t, vs, 1, "arm"); !errors.Is(err, ErrStateTimeout) {
+		t.Errorf("got %v, want ErrStateTimeout", err)
+	}
 }

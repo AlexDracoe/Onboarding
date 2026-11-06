@@ -18,45 +18,89 @@ import (
 )
 
 // fakeVehicle plays the drone: it records every command it is sent, optionally ACKs it
-// (through the real AckTracker), and optionally reports the commanded arm state after a delay.
+// (through the real AckTracker), and optionally reports the commanded state after a delay:
+// armed/disarmed, the new mode, the takeoff altitude, or the goto position.
 type fakeVehicle struct {
 	sm  *StateManager
 	at  *AckTracker
-	err error // returned by SendCommandLong instead of sending
+	err error // returned by the Send methods instead of sending
 
 	ackResult string        // "" = never ACK
 	reachAt   time.Duration // < 0 = never reach the commanded state
 
 	mu   sync.Mutex
-	sent []domain.CommandLong
+	sent []domain.Command
 }
 
 func (f *fakeVehicle) SendCommandLong(c domain.CommandLong) error {
+	return f.receive(c, func() {
+		switch c.Command {
+		case "NAV_TAKEOFF": // climb straight to the commanded altitude
+			f.sm.Apply(domain.GlobalPositionIntUpdate{SystemID: c.SystemID,
+				Position: domain.Position{RelativeAltitude: float64(c.Param7)}})
+		case "DO_SET_MODE":
+			f.sm.Apply(domain.HeartbeatUpdate{SystemID: c.SystemID, VehicleType: "QUADROTOR",
+				FlightMode: fakeModeNames[uint32(c.Param2)]})
+		default:
+			f.sm.Apply(domain.HeartbeatUpdate{SystemID: c.SystemID, IsArmed: c.Param1 == 1})
+		}
+	})
+}
+
+func (f *fakeVehicle) SendCommandInt(c domain.CommandInt) error {
+	return f.receive(c, func() { // DO_REPOSITION: teleport to the target
+		f.sm.Apply(domain.GlobalPositionIntUpdate{SystemID: c.SystemID, Position: domain.Position{
+			Latitude: float64(c.X) / 1e7, Longitude: float64(c.Y) / 1e7, RelativeAltitude: float64(c.Z)}})
+	})
+}
+
+// receive records m, ACKs it if configured, and runs reach after reachAt.
+func (f *fakeVehicle) receive(m domain.Command, reach func()) error {
 	if f.err != nil {
 		return f.err
 	}
 	f.mu.Lock()
-	f.sent = append(f.sent, c)
+	f.sent = append(f.sent, m)
 	f.mu.Unlock()
 
+	sys := systemOf(m)
 	if f.ackResult != "" {
-		go f.at.HandleAck(ack(c.SystemID, c.Command, f.ackResult))
+		go f.at.HandleAck(ack(sys, m.CommandName(), f.ackResult))
 	}
 	if f.reachAt >= 0 {
 		go func() {
 			time.Sleep(f.reachAt)
-			if c.Command == "NAV_TAKEOFF" { // climb straight to the commanded altitude
-				f.sm.Apply(domain.GlobalPositionIntUpdate{SystemID: c.SystemID,
-					Position: domain.Position{RelativeAltitude: float64(c.Param7)}})
-				return
-			}
-			f.sm.Apply(domain.HeartbeatUpdate{SystemID: c.SystemID, IsArmed: c.Param1 == 1})
+			reach()
 		}()
 	}
 	return nil
 }
 
-func (f *fakeVehicle) lastSent() domain.CommandLong {
+func systemOf(m domain.Command) uint8 {
+	switch c := m.(type) {
+	case domain.CommandLong:
+		return c.SystemID
+	case domain.CommandInt:
+		return c.SystemID
+	}
+	return 0
+}
+
+// fakeModes is a ModeResolver with a tiny copter table.
+type fakeModes struct{}
+
+var fakeModeNumbers = map[string]uint32{"STABILIZE": 0, "GUIDED": 4, "LOITER": 5, "RTL": 6, "LAND": 9}
+var fakeModeNames = map[uint32]string{0: "STABILIZE", 4: "GUIDED", 5: "LOITER", 6: "RTL", 9: "LAND"}
+
+func (fakeModes) ModeNumber(vehicleType, mode string) (uint32, bool) {
+	if vehicleType != "QUADROTOR" {
+		return 0, false
+	}
+	n, ok := fakeModeNumbers[mode]
+	return n, ok
+}
+
+func (f *fakeVehicle) lastSent() domain.Command {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.sent[len(f.sent)-1]
@@ -84,7 +128,7 @@ func newTestService(f *fakeVehicle, cfg config.Config) *VehicleService {
 func newSubmitService(f *fakeVehicle, cfg config.Config) (*VehicleService, *fakeLog) {
 	f.sm, f.at = NewStateManager(), NewAckTracker()
 	fl := &fakeLog{rows: map[string]row{}}
-	return NewVehicleService(f.sm, f.at, f, fl, cfg), fl
+	return NewVehicleService(f.sm, f.at, f, fakeModes{}, fl, cfg), fl
 }
 
 // row is one command record in the fake log.
@@ -163,16 +207,31 @@ func finalRow(t *testing.T, l *fakeLog, id string) row {
 	return row{}
 }
 
-// prepare runs the table's Prepare for name with body and fails the test on an error.
+// prepare runs the table's Prepare for name with body (no vehicle state) and fails the test on an error.
 func prepare(t *testing.T, name string, systemID uint8, body string) (CommandSpec, Bound) {
+	t.Helper()
+	return prepareWith(t, name, request{SystemID: systemID, Body: []byte(body), Modes: fakeModes{}})
+}
+
+// tablePrepare calls Prepare and returns its error; a command missing from the table fails the test.
+func tablePrepare(t *testing.T, name string, r request) (Bound, error) {
 	t.Helper()
 	spec, ok := commands[name]
 	if !ok {
-		t.Fatalf("no %q in the command table", name)
+		t.Fatalf("no %q in the command table yet", name)
 	}
-	b, err := spec.Prepare(request{SystemID: systemID, Body: []byte(body)})
+	return spec.Prepare(r)
+}
+
+func prepareWith(t *testing.T, name string, r request) (CommandSpec, Bound) {
+	t.Helper()
+	spec, ok := commands[name]
+	if !ok {
+		t.Fatalf("no %q in the command table yet", name)
+	}
+	b, err := spec.Prepare(r)
 	if err != nil {
-		t.Fatalf("Prepare %s %s: %v", name, body, err)
+		t.Fatalf("Prepare %s %s: %v", name, r.Body, err)
 	}
 	return spec, b
 }
@@ -230,7 +289,10 @@ func TestArmDisarmPredicates(t *testing.T) {
 
 func TestTakeoffBuild(t *testing.T) {
 	_, b := prepare(t, "takeoff", 3, `{"altitude": 10}`)
-	m := b.Msg
+	m, ok := b.Msg.(domain.CommandLong)
+	if !ok {
+		t.Fatalf("takeoff Msg is %T, want domain.CommandLong", b.Msg)
+	}
 	if m.SystemID != 3 || m.Command != "NAV_TAKEOFF" || m.Param7 != 10 {
 		t.Errorf("msg = %+v, want NAV_TAKEOFF for system 3 with Param7 10", m)
 	}
@@ -285,7 +347,7 @@ func TestPrepareRejectsBadParams(t *testing.T) {
 		{"takeoff", `{"altitude": "10"}`, "body:"},
 		{"takeoff", `{"altitde": 10}`, `unknown field "altitde"`},
 	} {
-		_, err := commands[c.name].Prepare(request{SystemID: 1, Body: []byte(c.body)})
+		_, err := commands[c.name].Prepare(request{SystemID: 1, Body: []byte(c.body), Modes: fakeModes{}})
 		var pe *ParamsError
 		if !errors.As(err, &pe) {
 			t.Errorf("%s %s: got %v, want a *ParamsError", c.name, c.body, err)
@@ -491,6 +553,8 @@ func TestSubmitCreateFailsStartsNothing(t *testing.T) {
 
 type panickingSender struct{}
 
+func (panickingSender) SendCommandInt(domain.CommandInt) error { return nil }
+
 func (panickingSender) SendCommandLong(domain.CommandLong) error {
 	var m map[string]int
 	m["boom"] = 1 // nil map write: panics
@@ -499,7 +563,7 @@ func (panickingSender) SendCommandLong(domain.CommandLong) error {
 
 func TestPanicEndsAsFailedNotPending(t *testing.T) {
 	fl := &fakeLog{rows: map[string]row{}}
-	vs := NewVehicleService(NewStateManager(), NewAckTracker(), panickingSender{}, fl, testConfig())
+	vs := NewVehicleService(NewStateManager(), NewAckTracker(), panickingSender{}, fakeModes{}, fl, testConfig())
 	logs := captureLog(t)
 
 	id, err := vs.Submit(1, "arm", nil)
@@ -607,7 +671,7 @@ func TestSubmitTakeoffAchieved(t *testing.T) {
 	if r := finalRow(t, fl, id); r.status != "ACHIEVED" {
 		t.Errorf("final row = %+v, want ACHIEVED", r)
 	}
-	if m := f.lastSent(); m.Command != "NAV_TAKEOFF" || m.Param7 != 10 {
+	if m, _ := f.lastSent().(domain.CommandLong); m.Command != "NAV_TAKEOFF" || m.Param7 != 10 {
 		t.Errorf("sent %+v, want NAV_TAKEOFF to 10 m", m)
 	}
 }
@@ -626,5 +690,224 @@ func TestKnownVehicleWrongStateTimesOut(t *testing.T) {
 	f.sm.Apply(domain.HeartbeatUpdate{SystemID: 1, IsArmed: false})
 	if err := execute(t, vs, 1, "arm"); !errors.Is(err, ErrStateTimeout) {
 		t.Errorf("got %v, want ErrStateTimeout", err)
+	}
+}
+
+// ---- set_mode ----
+
+func copter(mode string) *domain.VehicleState {
+	vt := "QUADROTOR"
+	return &domain.VehicleState{SystemID: 1, VehicleType: &vt, FlightMode: &mode}
+}
+
+func TestSetModeBuild(t *testing.T) {
+	_, b := prepareWith(t, "set_mode", request{SystemID: 2, Body: []byte(`{"mode": "GUIDED"}`),
+		State: copter("STABILIZE"), Modes: fakeModes{}})
+	want := domain.CommandLong{SystemID: 2, Command: "DO_SET_MODE", Param1: 1, Param2: 4}
+	if b.Msg != want {
+		t.Errorf("msg = %+v, want %+v", b.Msg, want)
+	}
+}
+
+func TestSetModePredicate(t *testing.T) {
+	_, b := prepareWith(t, "set_mode", request{SystemID: 1, Body: []byte(`{"mode": "GUIDED"}`),
+		State: copter("STABILIZE"), Modes: fakeModes{}})
+	for _, c := range []struct {
+		desc string
+		s    domain.VehicleState
+		want bool
+	}{
+		{"no heartbeat mode yet", domain.VehicleState{}, false}, // must not panic
+		{"old mode", *copter("STABILIZE"), false},
+		{"new mode", *copter("GUIDED"), true},
+	} {
+		if got := b.Predicate(c.s); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.desc, got, c.want)
+		}
+	}
+}
+
+func TestSetModeRejects(t *testing.T) {
+	for _, c := range []struct {
+		desc  string
+		body  string
+		state *domain.VehicleState
+		want  string
+	}{
+		{"missing", `{}`, copter("STABILIZE"), "mode: required"},
+		{"empty", `{"mode": ""}`, copter("STABILIZE"), "mode: required"},
+		{"unknown key", `{"mode": "GUIDED", "x": 1}`, copter("STABILIZE"), `unknown field "x"`},
+		{"not a string", `{"mode": 4}`, copter("STABILIZE"), "body:"},
+		{"unknown mode", `{"mode": "WARP"}`, copter("STABILIZE"), `unknown mode "WARP"`},
+		{"no telemetry yet", `{"mode": "GUIDED"}`, nil, "no heartbeat"},
+		{"heartbeat without a type", `{"mode": "GUIDED"}`, &domain.VehicleState{SystemID: 1}, "no heartbeat"},
+	} {
+		_, err := tablePrepare(t, "set_mode", request{SystemID: 1, Body: []byte(c.body), State: c.state, Modes: fakeModes{}})
+		var pe *ParamsError
+		if !errors.As(err, &pe) {
+			t.Errorf("%s: got %v, want a *ParamsError", c.desc, err)
+			continue
+		}
+		if !strings.Contains(pe.Error(), c.want) {
+			t.Errorf("%s: detail %q, want it to mention %q", c.desc, pe.Error(), c.want)
+		}
+	}
+}
+
+func TestSubmitSetModeAchieved(t *testing.T) {
+	f := &fakeVehicle{ackResult: "ACCEPTED", reachAt: 20 * time.Millisecond}
+	vs, fl := newSubmitService(f, testConfig())
+	f.sm.Apply(domain.HeartbeatUpdate{SystemID: 1, VehicleType: "QUADROTOR", FlightMode: "STABILIZE"})
+
+	id, err := vs.Submit(1, "set_mode", []byte(`{"mode": "GUIDED"}`))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if r := finalRow(t, fl, id); r.status != "ACHIEVED" || r.params != `{"mode":"GUIDED"}` {
+		t.Errorf("final row = %+v, want ACHIEVED with params {\"mode\":\"GUIDED\"}", r)
+	}
+}
+
+// Submit must hand Prepare the vehicle's current state: without a heartbeat, set_mode is a 422, not a 202.
+func TestSubmitSetModeWithoutHeartbeatIs422(t *testing.T) {
+	f := &fakeVehicle{ackResult: "ACCEPTED", reachAt: 0}
+	vs, fl := newSubmitService(f, testConfig())
+	_, err := vs.Submit(1, "set_mode", []byte(`{"mode": "GUIDED"}`))
+	var pe *ParamsError
+	if !errors.As(err, &pe) || fl.count() != 0 {
+		t.Errorf("got %v with %d rows, want a *ParamsError and no row", err, fl.count())
+	}
+}
+
+// ---- goto ----
+
+const homeLat, homeLong = -35.363261, 149.165230 // ArduPilot SITL default home
+
+func hovering(lat, long, relAlt float64) *domain.VehicleState {
+	return &domain.VehicleState{SystemID: 1, Position: &domain.Position{Latitude: lat, Longitude: long, RelativeAltitude: relAlt}}
+}
+
+func gotoBody(lat, long, alt float64) []byte {
+	return []byte(fmt.Sprintf(`{"lat": %v, "long": %v, "altitude": %v}`, lat, long, alt))
+}
+
+func TestGotoBuild(t *testing.T) {
+	lat, long := homeLat+0.001, homeLong+0.001 // ~145 m away
+	_, b := prepareWith(t, "goto", request{SystemID: 4, Body: gotoBody(lat, long, 25), State: hovering(homeLat, homeLong, 10)})
+	m, ok := b.Msg.(domain.CommandInt)
+	if !ok {
+		t.Fatalf("goto Msg is %T, want domain.CommandInt (ArduPilot needs COMMAND_INT for DO_REPOSITION)", b.Msg)
+	}
+	if m.SystemID != 4 || m.Command != "DO_REPOSITION" || m.Frame != "GLOBAL_RELATIVE_ALT_INT" {
+		t.Errorf("msg = %+v, want DO_REPOSITION to system 4 in GLOBAL_RELATIVE_ALT_INT", m)
+	}
+	if m.Param1 != -1 || m.Param2 != 0 || m.Param3 != 0 || !math.IsNaN(float64(m.Param4)) {
+		t.Errorf("params = %v %v %v %v, want -1 0 0 NaN", m.Param1, m.Param2, m.Param3, m.Param4)
+	}
+	wantX, wantY := int32(math.Round(lat*1e7)), int32(math.Round(long*1e7))
+	if d := m.X - wantX; d < -1 || d > 1 {
+		t.Errorf("X = %d, want %d (lat * 1e7)", m.X, wantX)
+	}
+	if d := m.Y - wantY; d < -1 || d > 1 {
+		t.Errorf("Y = %d, want %d (long * 1e7)", m.Y, wantY)
+	}
+	if m.Z != 25 {
+		t.Errorf("Z = %v, want 25", m.Z)
+	}
+}
+
+func TestGotoPredicate(t *testing.T) {
+	tLat, tLong := homeLat+0.001, homeLong
+	_, b := prepareWith(t, "goto", request{SystemID: 1, Body: gotoBody(tLat, tLong, 20), State: hovering(homeLat, homeLong, 10)})
+	for _, c := range []struct {
+		desc string
+		s    domain.VehicleState
+		want bool
+	}{
+		{"no position", domain.VehicleState{}, false}, // must not panic
+		{"at the target", *hovering(tLat, tLong, 20), true},
+		{"5 m alt off", *hovering(tLat, tLong, 25), true},
+		{"6 m alt off", *hovering(tLat, tLong, 14), false},
+		{"~5.6 m short", *hovering(tLat-0.00005, tLong, 20), true},
+		{"~11 m short", *hovering(tLat-0.0001, tLong, 20), false},
+		{"still at home", *hovering(homeLat, homeLong, 20), false},
+	} {
+		if got := b.Predicate(c.s); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.desc, got, c.want)
+		}
+	}
+}
+
+func TestGotoRejects(t *testing.T) {
+	here := hovering(homeLat, homeLong, 10)
+	for _, c := range []struct {
+		desc  string
+		body  string
+		state *domain.VehicleState
+		want  string
+	}{
+		{"all missing", `{}`, here, "lat: required;long: required;altitude: required"},
+		{"lat missing", `{"long": 149.1, "altitude": 10}`, here, "lat: required"},
+		{"lat too big", `{"lat": 91, "long": 149.1, "altitude": 10}`, here, "lat: must be between -90 and 90"},
+		{"long too small", `{"lat": -35, "long": -181, "altitude": 10}`, here, "long: must be between -180 and 180"},
+		{"alt too low", `{"lat": -35, "long": 149, "altitude": 1}`, here, "altitude: must be between 2 and 400"},
+		{"alt too high", `{"lat": -35, "long": 149, "altitude": 401}`, here, "altitude: must be between 2 and 400"},
+		{"two bad fields", `{"lat": 91, "long": 181, "altitude": 10}`, here, ";long: must be between -180 and 180"}, // lat first, joined by ;
+		{"unknown key", `{"lat": -35, "long": 149, "altitude": 10, "speed": 3}`, here, `unknown field "speed"`},
+		{"no telemetry", string(gotoBody(homeLat, homeLong, 10)), nil, "no position fix"},
+		{"no position yet", string(gotoBody(homeLat, homeLong, 10)), &domain.VehicleState{SystemID: 1}, "no position fix"},
+		{"too far", string(gotoBody(homeLat+0.006, homeLong, 10)), here, "max is 500 m"}, // ~667 m
+	} {
+		_, err := tablePrepare(t, "goto", request{SystemID: 1, Body: []byte(c.body), State: c.state, Modes: fakeModes{}})
+		var pe *ParamsError
+		if !errors.As(err, &pe) {
+			t.Errorf("%s: got %v, want a *ParamsError", c.desc, err)
+			continue
+		}
+		if !strings.Contains(pe.Error(), c.want) {
+			t.Errorf("%s: detail %q, want it to mention %q", c.desc, pe.Error(), c.want)
+		}
+	}
+}
+
+// lat 0 / long 0 are real coordinates: "missing" must come from a nil pointer, not from a zero value.
+func TestGotoAcceptsZeroCoordinates(t *testing.T) {
+	prepareWith(t, "goto", request{SystemID: 1, Body: gotoBody(0, 0, 10), State: hovering(0.001, 0.001, 10)})
+	prepareWith(t, "goto", request{SystemID: 1, Body: gotoBody(homeLat+0.004, homeLong, 10), State: hovering(homeLat, homeLong, 10)}) // ~445 m: allowed
+}
+
+func TestSubmitGotoAchieved(t *testing.T) {
+	f := &fakeVehicle{ackResult: "ACCEPTED", reachAt: 20 * time.Millisecond}
+	vs, fl := newSubmitService(f, testConfig())
+	f.sm.Apply(domain.GlobalPositionIntUpdate{SystemID: 1, Position: domain.Position{Latitude: homeLat, Longitude: homeLong, RelativeAltitude: 10}})
+
+	id, err := vs.Submit(1, "goto", gotoBody(homeLat+0.001, homeLong, 20))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if r := finalRow(t, fl, id); r.status != "ACHIEVED" || !strings.Contains(r.params, `"lat":`) {
+		t.Errorf("final row = %+v, want ACHIEVED with lat/long/altitude params", r)
+	}
+	if _, ok := f.lastSent().(domain.CommandInt); !ok {
+		t.Errorf("sent %T, want a CommandInt", f.lastSent())
+	}
+}
+
+func TestGotoUsesItsOwnTimeout(t *testing.T) {
+	if got := commands["goto"].Timeout; got != 200*time.Second {
+		t.Errorf("goto timeout = %v, want 200s", got)
+	}
+}
+
+func TestSendRoutesByType(t *testing.T) {
+	f := &fakeVehicle{ackResult: "ACCEPTED", reachAt: -1}
+	vs := newTestService(f, testConfig())
+	for _, m := range []domain.Command{domain.CommandLong{SystemID: 1, Command: "A"}, domain.CommandInt{SystemID: 1, Command: "B"}} {
+		if err := vs.send(m); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.lastSent(); got != m {
+			t.Errorf("sent %+v, want %+v", got, m)
+		}
 	}
 }

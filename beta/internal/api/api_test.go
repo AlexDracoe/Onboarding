@@ -191,7 +191,7 @@ func TestRealStackRoundTrip(t *testing.T) {
 	}
 	defer db.Close()
 	sm, at := app.NewStateManager(), app.NewAckTracker()
-	vs := app.NewVehicleService(sm, at, silentSender{}, db, testConfig())
+	vs := app.NewVehicleService(sm, at, silentSender{}, noModes{}, db, testConfig())
 	h := NewHandler(sm, vs, db)
 
 	code, body := do(t, h, "POST", "/vehicles/1/commands/arm", "")
@@ -241,7 +241,7 @@ func TestRealStackInvalidParams(t *testing.T) {
 	}
 	defer db.Close()
 	sm, at := app.NewStateManager(), app.NewAckTracker()
-	h := NewHandler(sm, app.NewVehicleService(sm, at, silentSender{}, db, testConfig()), db)
+	h := NewHandler(sm, app.NewVehicleService(sm, at, silentSender{}, noModes{}, db, testConfig()), db)
 
 	for _, c := range []struct{ path, body, detail string }{
 		{"/vehicles/1/commands/arm", "altitude=10", "body:"},

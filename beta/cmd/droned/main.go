@@ -33,7 +33,7 @@ func main() {
 	r := mavlink.NewReceiver(node.Events(), sm, at)
 	go r.Run()
 
-	vs := app.NewVehicleService(sm, at, mavlink.NewSender(node), db, cfg)
+	vs := app.NewVehicleService(sm, at, mavlink.NewSender(node), mavlink.Modes{}, db, cfg)
 
 	// TODO(phase 8): graceful shutdown (signal.NotifyContext + srv.Shutdown).
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: api.NewHandler(sm, vs, db)}

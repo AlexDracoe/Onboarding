@@ -17,20 +17,29 @@ var ErrStateTimeout = errors.New("state timeout")
 // CommandSender sends one command to a vehicle. Mavlink,sender implements it
 type CommandSender interface {
 	SendCommandLong(c domain.CommandLong) error
+	SendCommandInt(c domain.CommandInt) error
+}
+
+// ModeResolver turns a mode name into the vehicle's custom_mode number. mavlink.Modes implements it.
+type ModeResolver interface {
+	ModeNumber(vehicleType, mode string) (uint32, bool)
 }
 type CommandLog interface {
 	Create(systemID uint8, name string, params any) (id string, err error)
 	UpdateStatus(id, status string, cmdErr error) error
 }
 
+// request is what Prepare gets: who, the raw body, and what a check may need at submit time.
 type request struct {
 	SystemID uint8
 	Body     []byte
+	State    *domain.VehicleState // nil = no telemetry from this vehicle yet
+	Modes    ModeResolver
 }
 
 type Bound struct {
 	Params    any
-	Msg       domain.CommandLong
+	Msg       domain.Command // a CommandLong or a CommandInt
 	Predicate func(s domain.VehicleState) bool
 }
 
@@ -102,12 +111,13 @@ type VehicleService struct {
 	sm         *StateManager
 	acks       *AckTracker
 	sender     CommandSender
+	modes      ModeResolver
 	cfg        config.Config
 	commandLog CommandLog
 }
 
-func NewVehicleService(sm *StateManager, acks *AckTracker, sender CommandSender, commandLog CommandLog, cfg config.Config) *VehicleService {
-	return &VehicleService{sm: sm, acks: acks, sender: sender, commandLog: commandLog, cfg: cfg}
+func NewVehicleService(sm *StateManager, acks *AckTracker, sender CommandSender, modes ModeResolver, commandLog CommandLog, cfg config.Config) *VehicleService {
+	return &VehicleService{sm: sm, acks: acks, sender: sender, modes: modes, commandLog: commandLog, cfg: cfg}
 }
 
 func (vs *VehicleService) Submit(systemID uint8, name string, body []byte) (string, error) {
@@ -115,7 +125,11 @@ func (vs *VehicleService) Submit(systemID uint8, name string, body []byte) (stri
 	if !ok {
 		return "", fmt.Errorf("%q: %w", name, ErrUnknownCommand)
 	}
-	b, err := spec.Prepare(request{SystemID: systemID, Body: body})
+	r := request{SystemID: systemID, Body: body, Modes: vs.modes}
+	if s, ok := vs.sm.Get(systemID); ok {
+		r.State = &s
+	}
+	b, err := spec.Prepare(r)
 	if err != nil {
 		return "", err
 	}
@@ -152,13 +166,13 @@ func (vs *VehicleService) execute(id string, systemID uint8, name string, spec C
 
 // Execute runs one bound command: register, send, wait for the ACK, then for the predicate.
 func (vs *VehicleService) Execute(ctx context.Context, systemID uint8, spec CommandSpec, b Bound) error {
-	p, err := vs.acks.Register(systemID, b.Msg.Command)
+	p, err := vs.acks.Register(systemID, b.Msg.CommandName())
 	if err != nil {
 		return err
 	}
-	if err := vs.sender.SendCommandLong(b.Msg); err != nil {
+	if err := vs.send(b.Msg); err != nil {
 		vs.acks.discard(p)
-		return fmt.Errorf("send %s to system %d: %w", b.Msg.Command, systemID, err)
+		return fmt.Errorf("send %s to system %d: %w", b.Msg.CommandName(), systemID, err)
 	}
 
 	_, err = vs.acks.WaitForAck(p, vs.cfg.AckTimeout)
@@ -177,6 +191,17 @@ func (vs *VehicleService) Execute(ctx context.Context, systemID uint8, spec Comm
 		return fmt.Errorf("%s on system %d after %v: %w", spec.Description, systemID, timeout, err)
 	}
 	return nil
+}
+
+// send picks the sender method by the message's concrete type.
+func (vs *VehicleService) send(m domain.Command) error {
+	switch c := m.(type) {
+	case domain.CommandLong:
+		return vs.sender.SendCommandLong(c)
+	case domain.CommandInt:
+		return vs.sender.SendCommandInt(c)
+	}
+	return fmt.Errorf("no sender for %T", m)
 }
 
 func (vs *VehicleService) waitForState(ctx context.Context, systemID uint8, predicate func(s domain.VehicleState) bool) error {

@@ -10,6 +10,11 @@ import (
 type silentSender struct{}
 
 func (silentSender) SendCommandLong(domain.CommandLong) error { return nil }
+func (silentSender) SendCommandInt(domain.CommandInt) error   { return nil }
+
+type noModes struct{}
+
+func (noModes) ModeNumber(string, string) (uint32, bool) { return 0, false }
 
 func testConfig() config.Config {
 	cfg := config.Load()

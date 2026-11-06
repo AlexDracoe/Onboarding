@@ -1,0 +1,99 @@
+.fleet {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.fleet-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.5rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.fleet-empty {
+  padding: 1rem;
+  margin: 0;
+}
+
+.vcard {
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.vcard.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.vcard.is-stale {
+  opacity: 0.6;
+}
+
+.vcard-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.vcard-check {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  cursor: pointer;
+}
+
+.vcard-check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.vcard-name {
+  font-weight: 600;
+}
+
+.vcard-badges {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.4rem;
+}
+
+.vcard-alt {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+.details {
+  display: grid;
+  grid-template-columns: 1fr;
+  margin: 0.6rem 0 0;
+  padding-top: 0.5rem;
+  border-top: 1px dashed var(--border);
+  font-size: 0.8rem;
+}
+
+.details > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.12rem 0;
+}
+
+.details dt {
+  color: var(--text-dim);
+}
+
+.details dd {
+  margin: 0;
+  text-align: right;
+}

@@ -1,0 +1,52 @@
+.history {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.history-filter {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.history-filter input {
+  accent-color: var(--accent);
+}
+
+.history-scroll {
+  overflow: auto;
+}
+
+.history table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.history th {
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-dim);
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.history td {
+  padding: 0.4rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.history tbody tr:hover {
+  background: var(--surface-2);
+}
+
+.history-error {
+  color: var(--danger);
+}

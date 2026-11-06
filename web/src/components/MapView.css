@@ -1,0 +1,138 @@
+.map-card {
+  position: relative;
+  overflow: hidden;
+  min-height: 420px;
+}
+
+.map {
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+}
+
+.map-toolbar {
+  pointer-events: none;
+}
+
+.map-tools {
+  display: flex;
+  gap: 0.4rem;
+  pointer-events: auto;
+}
+
+.map-tools .btn {
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 0.35rem 0.7rem;
+  font-size: 0.8rem;
+}
+
+.map-legend {
+  margin: 0.5rem 0 0 10px !important;
+  padding: 0.3rem 0.6rem;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface) 85%, transparent);
+  color: var(--text-dim);
+  font-size: 0.72rem;
+}
+
+.leaflet-container {
+  font: inherit;
+}
+
+.leaflet-tooltip {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  font-size: 0.75rem;
+}
+
+.leaflet-control-layers,
+.leaflet-bar a {
+  background: var(--surface) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+}
+
+/* ---- Markers ---- */
+
+.drone-icon {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.drone-icon svg {
+  width: 30px;
+  height: 30px;
+  fill: #f5f7fa;
+  stroke: #0b1017;
+  stroke-width: 1.2;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.6));
+  transition: transform 0.4s ease;
+}
+
+.drone-icon.is-armed svg {
+  fill: #f2555a;
+}
+
+.drone-icon.is-selected::before {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border: 2px solid #3b9eff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px rgba(59, 158, 255, 0.25);
+}
+
+.drone-icon.is-stale {
+  opacity: 0.45;
+}
+
+.drone-icon span {
+  position: absolute;
+  bottom: -6px;
+  right: -2px;
+  min-width: 18px;
+  padding: 0 4px;
+  border-radius: 9px;
+  background: #0b1017;
+  color: #fff;
+  font: 600 11px/18px var(--mono);
+  text-align: center;
+}
+
+.home-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--home);
+  color: #fff;
+  font: 700 13px var(--mono);
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+
+.target-icon {
+  width: 30px;
+  height: 30px;
+  border: 2px solid #f0a637;
+  border-radius: 50%;
+  background: radial-gradient(circle, #f0a637 0 3px, transparent 4px);
+  animation: target-pulse 1.6s ease-out infinite;
+}
+
+@keyframes target-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(240, 166, 55, 0.6);
+  }
+  100% {
+    box-shadow: 0 0 0 14px rgba(240, 166, 55, 0);
+  }
+}
